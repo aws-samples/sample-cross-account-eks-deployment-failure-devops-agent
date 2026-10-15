@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Routes CodePipeline stage failures to DevOps Agent via the
+  CreateBacklogTask API, enriched with the target deployment account
+  and EKS cluster for the failed stage.
+
+Parameters:
+  AgentSpaceId:
+    Type: String
+    Description: The DevOps Agent Space ID that will receive investigation tasks
+
+  AgentSpaceRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region where the Agent Space resides
+
+  StageTargets:
+    Type: String
+    Description: >-
+      Comma-separated map of stage name to target account and cluster, as
+      STAGE=ACCOUNT_ID:CLUSTER_NAME. Example:
+      DeployToProd=399859754393:prod-workloads,DeployToDev=111111111111:dev-cluster
+
+Resources:
+  TaskCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CreateBacklogTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: aidevops:CreateBacklogTask
+                Resource: !Sub >-
+                  arn:aws:aidevops:${AgentSpaceRegion}:${AWS::AccountId}:agentspace/${AgentSpaceId}
+
+  TaskCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: devops-agent-pipeline-failure
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TaskCreatorRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+          AGENT_SPACE_REGION: !Ref AgentSpaceRegion
+          STAGE_TARGETS: !Ref StageTargets
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          client = boto3.client(
+              "devops-agent",
+              region_name=os.environ["AGENT_SPACE_REGION"],
+          )
+
+
+          def parse_stage_targets(raw):
+              """
+              Parse STAGE_TARGETS into {stage: {"account": ..., "cluster": ...}}.
+              Format: STAGE=ACCOUNT:CLUSTER,STAGE=ACCOUNT:CLUSTER
+              """
+              mapping = {}
+              for pair in filter(None, (p.strip() for p in raw.split(","))):
+                  stage, _, target = pair.partition("=")
+                  account, _, cluster = target.partition(":")
+                  if stage and account and cluster:
+                      mapping[stage.strip()] = {
+                          "account": account.strip(),
+                          "cluster": cluster.strip(),
+                      }
+              return mapping
+
+
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+
+              detail = event.get("detail", {})
+              pipeline = detail.get("pipeline", "unknown")
+              stage = detail.get("stage", "unknown")
+              execution_id = detail.get("execution-id", "unknown")
+              tooling_account = event.get("account", "unknown")
+              region = event.get("region", "unknown")
+
+              targets = parse_stage_targets(os.environ.get("STAGE_TARGETS", ""))
+              target = targets.get(stage)
+
+              if target:
+                  deployment_account = target["account"]
+                  cluster = target["cluster"]
+                  where = (
+                      f"This stage deploys to Amazon EKS cluster "
+                      f"'{cluster}' in account {deployment_account}. "
+                      f"Investigate the deployment rollout, pod states, "
+                      f"pod events, container logs, and resource capacity "
+                      f"in that cluster to determine the root cause."
+                  )
+              else:
+                  # Stage not mapped: tell the Agent explicitly rather than
+                  # letting it guess which cluster to inspect.
+                  deployment_account = "unknown"
+                  cluster = "unknown"
+                  where = (
+                      f"No target mapping is configured for stage "
+                      f"'{stage}'. Resolve the deployment account and "
+                      f"EKS cluster from the pipeline definition before "
+                      f"investigating."
+                  )
+
+              title = f"Pipeline {pipeline} - {stage} FAILED"
+              description = json.dumps(
+                  {
+                      "summary": (
+                          f"CodePipeline {pipeline} failed at stage "
+                          f"{stage}. The pipeline runs in tooling account "
+                          f"{tooling_account} ({region}). {where}"
+                      ),
+                      "pipeline": pipeline,
+                      "stage": stage,
+                      "executionId": execution_id,
+                      "toolingAccount": tooling_account,
+                      "deploymentAccount": deployment_account,
+                      "cluster": cluster,
+                      "region": region,
+                      "event": event,
+                  }
+              )
+
+              response = client.create_backlog_task(
+                  agentSpaceId=os.environ["AGENT_SPACE_ID"],
+                  taskType="INVESTIGATION",
+                  priority="HIGH",
+                  title=title,
+                  description=description,
+              )
+
+              task = response.get("task", {})
+              print(f"Created investigation task: {task.get('taskId', '')}")
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({"taskId": task.get("taskId", "")}),
+              }
+
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: devops-agent-pipeline-stage-failures
+      Description: Detects CodePipeline stage failures and triggers DevOps Agent
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - 'CodePipeline Stage Execution State Change'
+        detail:
+          state:
+            - FAILED
+      Targets:
+        - Arn: !GetAtt TaskCreatorFunction.Arn
+          Id: DevOpsAgentTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TaskCreatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineFailureRule.Arn
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TaskCreatorFunction}'
+      RetentionInDays: 14
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt TaskCreatorFunction.Arn
+  EventBridgeRuleArn:
+    Value: !GetAtt PipelineFailureRule.Arn
