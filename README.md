@@ -8,7 +8,7 @@ This repository contains the integration only. It assumes you already run CodePi
 
 ## Architecture
 
-![Cross-Account EKS Deployment Failure Investigation](Images/eks-deployment-failure-investigation.png)
+![Cross-Account EKS Deployment Failure Investigation](eks-deployment-failure-investigation.png)
 
 The architecture consists of the following components:
 
