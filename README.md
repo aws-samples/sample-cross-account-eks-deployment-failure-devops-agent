@@ -30,7 +30,6 @@ The architecture consists of the following components:
 ## Prerequisites
 
 **Monitoring account** (where the Agent Space lives):
-- AWS Enterprise Support or Business Support plan (required for DevOps Agent access)
 - IAM permissions to create an Agent Space and configure capabilities
 - CloudWatch read access across connected accounts, granted automatically through secondary source connections
 - (Optional) GitHub connection for manifest and code visibility
@@ -112,6 +111,16 @@ The policy grants `codepipeline:GetPipelineExecution`, `codepipeline:ListActionE
 
 ### 3. Create EKS access entries
 
+**Note:** Access entries require the cluster's authentication mode to be `API` or `API_AND_CONFIG_MAP`. Check it with 
+```bash
+aws eks describe-cluster --name my-app-cluster --query cluster.accessConfig.authenticationMode. 
+```
+If it returns CONFIG_MAP, update it with
+```bash
+aws eks update-cluster-config --name my-app-cluster --access-config authenticationMode=API_AND_CONFIG_MAP
+```
+This change can't be reversed.
+
 DevOps Agent calls the Kubernetes API *as the role it assumes in that account*, so the access entry principal must match:
 
 | Cluster location | Access entry principal |
@@ -135,6 +144,8 @@ aws eks associate-access-policy \
   --access-scope type=cluster \
   --region <region>
 ```
+**Note:** `type=cluster` grants the read-only AmazonAIOpsAssistantPolicy permissions in all namespaces. To limit the Agent to specific namespaces, use `--access-scope type=namespace,namespaces=<namespace>` instead.
+
 
 Verify:
 
@@ -149,7 +160,7 @@ aws eks list-associated-access-policies \
 
 See [EKS access setup for DevOps Agent](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-aws-eks-access-setup.html).
 
-### 3. Confirm Container Insights is enabled
+### 4. Confirm Container Insights is enabled
 
 Container Insights is **required** for DevOps Agent to access pod-level metrics, events, and log visibility.
 
@@ -170,7 +181,7 @@ aws logs describe-log-groups \
 You should see four groups: application, dataplane, host, and performance. If they are missing, the CloudWatch agent lacks permission to publish. Refer [Install the CloudWatch Observability add-on] (https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Observability-EKS-addon.html) for fix.
 
 
-### 4. Deploy the integration stack (tooling account)
+### 5. Deploy the integration stack (tooling account)
 
 Deploy in the **tooling account**, where CodePipeline runs. `template.yaml` creates the EventBridge rule, the Lambda, and a least-privilege IAM role. The `StageTargets` parameter maps each deployment stage to its target account and cluster, so the Lambda can tell the Agent where to investigate.
 
@@ -189,7 +200,37 @@ aws cloudformation deploy \
 `StageTargets` format: `STAGE=ACCOUNT:CLUSTER,STAGE=ACCOUNT:CLUSTER`. Example:
 `DeployToDev=111111111111:dev-cluster,DeployToProd=222222222222:prod-workloads`
 
+### 6. Ticketing and chat integrations
 
+DevOps Agent supports native connections to ITSM and chat platforms so investigation findings land in the tools your team already uses. Connect these from **Capabilities** in the Agent Space console.
+
+At time of writing, supported integrations include Jira, ServiceNow, Slack, and Microsoft Teams. Check the [DevOps Agent documentation](https://docs.aws.amazon.com/devopsagent/latest/userguide/) for the current list.
+
+### Enriching tickets with custom fields
+
+Native integrations create tickets from the Agent's findings summary. If your workflow needs structured fields the native integration does not populate — root cause category, environment-based priority, commit SHA, or cluster ARN — subscribe a Lambda function to investigation completion events and call your ITSM platform's API.
+
+The pattern is platform-agnostic. Substitute the endpoint and payload shape for your platform (Jira Cloud REST API, ServiceNow Table API, Azure DevOps Work Items API, and so on).
+
+```python
+# Map Kubernetes failure signals to your own taxonomy
+ROOT_CAUSE_CATEGORIES = {
+    "CreateContainerConfigError": "Configuration Error",
+    "ImagePullBackOff": "Permission or Registry Issue",
+    "CrashLoopBackOff": "Application Startup Failure",
+    "OOMKilled": "Resource Exhaustion",
+    "FailedScheduling": "Resource Exhaustion",
+}
+
+# Map deployment stage to your platform's priority scheme
+STAGE_PRIORITY = {
+    "prod": "P1",
+    "staging": "P2",
+    "dev": "P3",
+}
+```
+
+Keep the mapping tables in configuration rather than code so the same Lambda works across platforms.
 
 ## Testing
 
@@ -305,34 +346,3 @@ aws iam delete-role --role-name <secondary-role-name>
 
 Your Agent Space, CodePipeline pipelines, EKS clusters, and Container Insights configuration are untouched by the above. Remove the Agent Space from the DevOps Agent console if you no longer need it. Note that Container Insights continues to incur CloudWatch charges if you leave it enabled.
 
-## Ticketing and chat integrations
-
-DevOps Agent supports native connections to ITSM and chat platforms so investigation findings land in the tools your team already uses. Connect these from **Capabilities** in the Agent Space console.
-
-At time of writing, supported integrations include Jira, ServiceNow, Slack, and Microsoft Teams. Check the [DevOps Agent documentation](https://docs.aws.amazon.com/devopsagent/latest/userguide/) for the current list.
-
-### Enriching tickets with custom fields
-
-Native integrations create tickets from the Agent's findings summary. If your workflow needs structured fields the native integration does not populate — root cause category, environment-based priority, commit SHA, or cluster ARN — subscribe a Lambda function to investigation completion events and call your ITSM platform's API.
-
-The pattern is platform-agnostic. Substitute the endpoint and payload shape for your platform (Jira Cloud REST API, ServiceNow Table API, Azure DevOps Work Items API, and so on).
-
-```python
-# Map Kubernetes failure signals to your own taxonomy
-ROOT_CAUSE_CATEGORIES = {
-    "CreateContainerConfigError": "Configuration Error",
-    "ImagePullBackOff": "Permission or Registry Issue",
-    "CrashLoopBackOff": "Application Startup Failure",
-    "OOMKilled": "Resource Exhaustion",
-    "FailedScheduling": "Resource Exhaustion",
-}
-
-# Map deployment stage to your platform's priority scheme
-STAGE_PRIORITY = {
-    "prod": "P1",
-    "staging": "P2",
-    "dev": "P3",
-}
-```
-
-Keep the mapping tables in configuration rather than code so the same Lambda works across platforms.
