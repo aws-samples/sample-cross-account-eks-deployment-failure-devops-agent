@@ -6,6 +6,10 @@ When a pipeline stage fails while deploying to an EKS cluster in a different AWS
 
 This repository contains the integration only. It assumes you already run CodePipeline in a tooling account and Amazon EKS clusters in one or more deployment accounts.
 
+## Disclaimer
+
+The sample code in this repository is provided for demonstration and educational purposes only. It is not intended for production use as-is. You are responsible for reviewing, testing, and hardening the code, and for evaluating its security, compliance, and operational suitability, before deploying it in your own environment.
+
 ## Architecture
 
 ![Cross-Account EKS Deployment Failure Investigation](eks-deployment-failure-investigation.png)
@@ -31,7 +35,6 @@ The architecture consists of the following components:
 
 **Monitoring account** (where the Agent Space lives):
 - IAM permissions to create an Agent Space and configure capabilities
-- CloudWatch read access across connected accounts, granted automatically through secondary source connections
 - (Optional) GitHub connection for manifest and code visibility
 - (Optional) Jira or Slack connection for incident tracking and notifications
 
@@ -40,10 +43,7 @@ The architecture consists of the following components:
 - IAM permissions to create CloudFormation stacks, Lambda functions, EventBridge rules, and IAM roles
 
 **Deployment account(s)** (where EKS workloads run):
-- An existing Amazon EKS cluster
-- Container Insights enabled on the cluster
 - An IAM role for DevOps Agent cross-account access with the `AIDevOpsAgentAccessPolicy` managed policy
-- An EKS access entry granting that role Kubernetes API access
 
 **Tooling:**
 - AWS CLI v2.34 or later
